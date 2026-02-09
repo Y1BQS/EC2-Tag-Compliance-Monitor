@@ -101,7 +101,6 @@ cat out.json
 ```
 ├── main.py           # Lambda handler
 ├── README.md
-├── template.yaml     # Legacy SAM (reference)
 └── terraform/
     ├── main.tf
     ├── variables.tf
