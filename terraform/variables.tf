@@ -68,7 +68,7 @@ variable "region_scope" {
 }
 
 variable "schedule_expression" {
-  description = "EventBridge schedule (e.g. rate(1 day) or cron(0 6 * * ? *) for 06:00 UTC daily)"
+  description = "EventBridge schedule (e.g. rate(1 day) or cron(0 13 * * ? *) for 09:00 EDT / 13:00 UTC daily)"
   type        = string
-  default     = "rate(1 day)"
+  default     = "cron(0 13 * * ? *)"
 }
