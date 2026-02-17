@@ -16,9 +16,10 @@ variable "state_table_name" {
   default     = "TagComplianceState"
 }
 
-variable "ses_from_address" {
-  description = "SES verified From address (e.g. your test sender)"
+variable "sns_topic_name" {
+  description = "SNS topic name for compliance notifications"
   type        = string
+  default     = "TagComplianceNotifications"
 }
 
 variable "fallback_finops_dl" {

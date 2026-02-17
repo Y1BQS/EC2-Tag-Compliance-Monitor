@@ -16,7 +16,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-# Lambda deployment package (main.py from parent directory)
+# Lambda deployment packages
 data "archive_file" "lambda" {
   type        = "zip"
   source_file = "${path.module}/../main.py"
@@ -63,7 +63,7 @@ resource "aws_iam_role" "lambda" {
   })
 }
 
-# IAM policy: EC2, CloudTrail, DynamoDB, SES
+# IAM policy: EC2, CloudTrail, DynamoDB, SNS
 resource "aws_iam_role_policy" "lambda" {
   name   = "${var.function_name}-policy"
   role   = aws_iam_role.lambda.id
@@ -94,8 +94,8 @@ resource "aws_iam_role_policy" "lambda" {
       },
       {
         Effect   = "Allow"
-        Action   = ["ses:SendEmail", "ses:SendRawEmail"]
-        Resource = "*"
+        Action   = ["sns:Publish"]
+        Resource = [aws_sns_topic.compliance.arn]
       },
       {
         Effect   = "Allow"
@@ -104,6 +104,29 @@ resource "aws_iam_role_policy" "lambda" {
       }
     ]
   })
+}
+
+# SNS topic for compliance notifications
+resource "aws_sns_topic" "compliance" {
+  name = var.sns_topic_name
+}
+
+# FinOps DL email subscription with filter
+resource "aws_sns_topic_subscription" "finops" {
+  topic_arn                       = aws_sns_topic.compliance.arn
+  protocol                        = "email"
+  endpoint                        = var.fallback_finops_dl
+  filter_policy                   = jsonencode({ "recipient_type" = ["finops", "unknown"] })
+  raw_message_delivery = false
+}
+
+# Team DL email subscription with filter
+resource "aws_sns_topic_subscription" "team" {
+  topic_arn                       = aws_sns_topic.compliance.arn
+  protocol                        = "email"
+  endpoint                        = var.terraform_team_dl
+  filter_policy                   = jsonencode({ "recipient_type" = ["team", "terraform", "cicd", "assumed_role", "aws_service"] })
+  raw_message_delivery = false
 }
 
 # Lambda function
@@ -120,7 +143,7 @@ resource "aws_lambda_function" "scanner" {
   environment {
     variables = {
       STATE_TABLE             = aws_dynamodb_table.state.name
-      SES_FROM_ADDRESS        = var.ses_from_address
+      SNS_TOPIC_ARN           = aws_sns_topic.compliance.arn
       FINOPS_DL               = var.fallback_finops_dl
       TEAM_DL                 = var.terraform_team_dl
       PLATFORM_APP_DL         = var.platform_app_dl != "" ? var.platform_app_dl : var.fallback_finops_dl

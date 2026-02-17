@@ -17,3 +17,8 @@ output "eventbridge_rule_arn" {
   description = "EventBridge schedule rule ARN"
   value       = aws_cloudwatch_event_rule.schedule.arn
 }
+
+output "sns_topic_arn" {
+  description = "SNS topic ARN for compliance notifications"
+  value       = aws_sns_topic.compliance.arn
+}

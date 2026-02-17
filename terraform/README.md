@@ -6,16 +6,14 @@ Deploys the EC2 tag compliance scanner Lambda with EventBridge schedule, DynamoD
 
 - Terraform >= 1.0
 - AWS CLI configured with credentials
-- SES: Verify `ses_from_address` (and To addresses if in sandbox)
 - CloudTrail enabled and logging `RunInstances`
 
 ## Required Variables
 
 | Variable | Description |
 |----------|-------------|
-| `ses_from_address` | SES verified From address |
 | `fallback_finops_dl` | FinOps DL for unknown creator / no trail |
-| `terraform_team_dl` | Team DL for Terraform/CI-CD roles |
+| `terraform_team_dl` | Team DL for Terraform/CI-CD and creator cases |
 
 ## Optional Variables
 
@@ -42,7 +40,6 @@ Deploys the EC2 tag compliance scanner Lambda with EventBridge schedule, DynamoD
 2. Plan (provide required variables):
    ```bash
    terraform plan \
-     -var="ses_from_address=you@example.com" \
      -var="fallback_finops_dl=finops@example.com" \
      -var="terraform_team_dl=team@example.com"
    ```
@@ -50,7 +47,6 @@ Deploys the EC2 tag compliance scanner Lambda with EventBridge schedule, DynamoD
 3. Apply:
    ```bash
    terraform apply \
-     -var="ses_from_address=you@example.com" \
      -var="fallback_finops_dl=finops@example.com" \
      -var="terraform_team_dl=team@example.com"
    ```
@@ -58,7 +54,6 @@ Deploys the EC2 tag compliance scanner Lambda with EventBridge schedule, DynamoD
 Alternatively, create `terraform.tfvars`:
 
 ```hcl
-ses_from_address     = "you@example.com"
 fallback_finops_dl   = "finops@example.com"
 terraform_team_dl    = "team@example.com"
 ```

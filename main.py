@@ -1,20 +1,18 @@
 """
 EC2 tag compliance scanner: scan EC2 instances, check required tags from
 Cloud Tagging Policy. For each non-compliant instance, resolve recipient:
-OwnerEmail tag, else CloudTrail creator → Human (email user), Terraform (team DL),
-CI/CD (team DL), Unknown (Cloud/FinOps DL). Sends emails via SES.
+OwnerEmail tag or CloudTrail creator → Team DL or FinOps DL. Creator/owner
+identity is included as a note in the email so the team can reach out to
+that person. Sends notifications via SNS (no direct creator emails).
 
-Escalation: Day 0 → email creator; Day 3 → reminder; Day 5 → escalate to FinOps/creator.
+Escalation: Day 0 → Team/FinOps DL; Day 3 → reminder; Day 5 → escalate to FinOps.
 State tracked in DynamoDB. Auto-close when tags fixed.
-
-Enhancement:
-- If creator is an AWS SSO (IAM Identity Center) session (role starts with AWSReservedSSO_),
-  email the SSO user's email from the session name.
 """
 import os
 import re
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -42,7 +40,7 @@ EMAIL_DOMAIN = os.environ.get("EMAIL_DOMAIN", "")
 LOOKBACK_DAYS = int(os.environ.get("CLOUDTRAIL_LOOKBACK_DAYS", "30"))
 REGION_SCOPE = os.environ.get("REGION_SCOPE", "")
 STATE_TABLE = os.environ.get("STATE_TABLE", "")
-SES_FROM_ADDRESS = os.environ.get("SES_FROM_ADDRESS", "")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 
 def regions_to_scan():
@@ -216,10 +214,21 @@ def _subject_for_stage(instance_id: str, missing_count: int, stage: str) -> str:
     return f"[ACTION REQUIRED] EC2 tag compliance: missing {missing_count} tag(s) on {instance_id}"
 
 
+def _instance_name(tags: dict) -> str | None:
+    """Best-effort EC2 instance name from common Name tag variants."""
+    for key in ("Name", "name", "INSTANCE_NAME", "InstanceName"):
+        val = tags.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return None
+
+
 def lambda_handler(event, context):
-    """Scan EC2 instances, resolve recipient, send emails via SES, track state in DynamoDB (Day 0/3/5 escalation)."""
+    """Scan EC2 instances, resolve recipient, track state, then publish one SNS notification per recipient (Day 0/3/5 escalation)."""
     logger.info("Starting EC2 tag compliance scan; regions=%s", regions_to_scan())
     total_scanned = total_noncompliant = total_notified = 0
+    # recipient_email -> list of per-instance notification entries
+    notifications_by_recipient: dict[str, list[dict]] = defaultdict(list)
 
     for region in regions_to_scan():
         ec2 = boto3.client("ec2", region_name=region)
@@ -239,6 +248,7 @@ def lambda_handler(event, context):
                         else {}
                     )
                     missing = [k for k in REQUIRED_TAGS if not _tag_present(tags, k)]
+                    inst_name = _instance_name(tags)
 
                     try:
                         if not missing:
@@ -246,15 +256,33 @@ def lambda_handler(event, context):
                             state = _get_state_from_dynamodb(instance_id, region)
                             if state and state.get("stage") != "closed":
                                 _close_state_in_dynamodb(instance_id, region)
-                                logger.info("Auto-closed: %s in %s (tags fixed)", instance_id, region)
+                                logger.info(
+                                    "Auto-closed compliant instance %s (%s) in %s (tags fixed)",
+                                    instance_id,
+                                    inst_name or "(no Name tag)",
+                                    region,
+                                )
+                            else:
+                                logger.info(
+                                    "Instance %s (%s) in %s is compliant (all required tags present)",
+                                    instance_id,
+                                    inst_name or "(no Name tag)",
+                                    region,
+                                )
                             continue
 
+                        logger.info(
+                            "Non-compliant instance %s (%s) in %s; missing tags=%s",
+                            instance_id,
+                            inst_name or "(no Name tag)",
+                            region,
+                            ",".join(missing),
+                        )
                         total_noncompliant += 1
-                        recipient, reason = _resolve_recipient(inst, tags, region)
+                        recipient, reason, contact_for_team = _resolve_recipient(inst, tags, region)
                         state = _get_state_from_dynamodb(instance_id, region)
 
                         now = datetime.now(timezone.utc).isoformat()
-                        recipients_to_email = [recipient]
                         stage_to_send = "day0"
 
                         if not state:
@@ -269,7 +297,6 @@ def lambda_handler(event, context):
                             if days >= 5 and current_stage != "day5":
                                 # Escalate to Day 5 (one-time)
                                 stage_to_send = "day5"
-                                recipients_to_email = list({recipient, FINOPS_DL})
                                 _update_state_in_dynamodb(
                                     instance_id, region,
                                     last_notified_at=now, stage="day5",
@@ -284,15 +311,69 @@ def lambda_handler(event, context):
                                     recipient=recipient, recipient_reason=reason, missing_tags=missing,
                                 )
                             else:
-                                # Day 0-2: no action; Day 3 already sent; Day 5 already sent
+                                # Day 0 already sent (days < 3), or Day 3/Day 5 already sent.
+                                # Do not resend Day 0; wait until Day 3 or Day 5 thresholds.
                                 continue
 
-                        subject = _subject_for_stage(instance_id, len(missing), stage_to_send)
-                        body = _build_body(instance_id, region, tags, missing, recipient, reason, stage=stage_to_send)
-                        if _send_email_via_ses(recipients_to_email, subject, body):
-                            total_notified += 1
+                        # Aggregate this instance for the primary recipient
+                        _collect_notification(
+                            notifications_by_recipient,
+                            recipient,
+                            instance_id,
+                            region,
+                            tags,
+                            missing,
+                            reason,
+                            stage_to_send,
+                            contact_for_team,
+                        )
+                        # For Day 5 escalation, also include the instance in the FinOps DL batch
+                        if stage_to_send == "day5" and recipient != FINOPS_DL:
+                            _collect_notification(
+                                notifications_by_recipient,
+                                FINOPS_DL,
+                                instance_id,
+                                region,
+                                tags,
+                                missing,
+                                "Escalation" + (f" (please reach out to {contact_for_team})" if contact_for_team else ""),
+                                stage_to_send,
+                                contact_for_team,
+                            )
                     except Exception as e:
                         logger.warning("Error processing instance %s in %s: %s", instance_id, region, e, exc_info=True)
+
+    # After scanning all instances, send a single batched notification per recipient
+    for recipient_email, instances in notifications_by_recipient.items():
+        # Determine dominant stage (day5 > day3 > day0) across this recipient's instances
+        stage_order = {"day0": 0, "day3": 1, "day5": 2}
+        max_stage = max(inst["stage"] for inst in instances)
+        max_stage = max(instances, key=lambda i: stage_order.get(i["stage"], 0))["stage"]
+
+        # Determine recipient_type (already computed during aggregation, but recompute for consistency)
+        recipient_type = _recipient_to_sns_type(recipient_email)
+        subject = _build_batch_subject(recipient_email, recipient_type, instances, max_stage)
+        body = _build_batch_body(recipient_email, recipient_type, instances, max_stage)
+
+        # Use the first instance for message attribute context
+        first = instances[0]
+        if _publish_to_sns(
+            recipient_type,
+            recipient_email,
+            first["instance_id"],
+            first["region"],
+            max_stage,
+            subject,
+            body,
+        ):
+            total_notified += 1
+            logger.info(
+                "Prepared batched notification for %s (%s) with %d noncompliant instance(s); max_stage=%s",
+                recipient_email,
+                recipient_type,
+                len(instances),
+                max_stage,
+            )
 
     logger.info("Scan complete. scanned=%d noncompliant=%d notified=%d", total_scanned, total_noncompliant, total_notified)
     return {
@@ -302,32 +383,162 @@ def lambda_handler(event, context):
     }
 
 
-def _send_email_via_ses(
-    recipients: list[str],
+def _recipient_to_sns_type(recipient: str) -> str:
+    """Map recipient email to SNS recipient_type for filtering (team or finops only; no direct creator emails)."""
+    if recipient == FINOPS_DL:
+        return "finops"
+    if recipient == TEAM_DL or recipient == PLATFORM_APP_DL:
+        return "team"
+    return "unknown"
+
+
+def _collect_notification(
+    notifications_by_recipient: dict[str, list[dict]],
+    recipient_email: str,
+    instance_id: str,
+    region: str,
+    tags: dict,
+    missing: list,
+    reason: str,
+    stage: str,
+    contact_for_team: str | None = None,
+) -> None:
+    """Append a per-instance notification entry for a given recipient."""
+    entry = {
+        "instance_id": instance_id,
+        "region": region,
+        "name": _instance_name(tags),
+        "missing_tags": list(missing),
+        "stage": stage,
+        "recipient_reason": reason,
+        "tags": dict(tags),
+        "contact_for_team": contact_for_team,
+    }
+    notifications_by_recipient[recipient_email].append(entry)
+
+
+def _build_batch_subject(
+    recipient_email: str,
+    recipient_type: str,
+    instances: list[dict],
+    max_stage: str,
+) -> str:
+    """Subject for a batched notification per recipient."""
+    count = len(instances)
+    if max_stage == "day5":
+        prefix = "[ESCALATION]"
+    elif max_stage == "day3":
+        prefix = "[REMINDER]"
+    else:
+        prefix = "[ACTION REQUIRED]"
+    return f"{prefix} EC2 tag compliance: {count} non-compliant instance(s)"
+
+
+def _build_batch_body(
+    recipient_email: str,
+    recipient_type: str,
+    instances: list[dict],
+    max_stage: str,
+) -> str:
+    """Plain-text body for a batched notification per recipient."""
+    stage_label = {
+        "day0": "Initial notice (Day 0)",
+        "day3": "Reminder (Day 3)",
+        "day5": "Escalation (Day 5+)",
+    }.get(max_stage, "Initial notice")
+
+    intro_lines = [
+        f"This is a consolidated EC2 tag compliance notification ({stage_label}).",
+        f"Recipient: {recipient_email} (type: {recipient_type})",
+        "",
+        "The following EC2 instances are missing required tags and require your attention:",
+        "",
+    ]
+
+    lines: list[str] = intro_lines
+
+    for idx, inst in enumerate(instances, start=1):
+        name = inst.get("name") or "(not set)"
+        stage = inst.get("stage", "day0")
+        per_stage_label = {
+            "day0": "Initial notice (Day 0)",
+            "day3": "Reminder (Day 3)",
+            "day5": "Escalation (Day 5+)",
+        }.get(stage, "Initial notice")
+
+        lines.extend(
+            [
+                f"#{idx} Instance ID: {inst['instance_id']}",
+                f"   Name: {name}",
+                f"   Region: {inst['region']}",
+                f"   Stage: {per_stage_label}",
+                f"   Recipient reason: {inst.get('recipient_reason', '')}",
+            ]
+        )
+        contact = inst.get("contact_for_team")
+        if contact:
+            missing_list = ", ".join(inst.get("missing_tags", []))
+            lines.append(f"   Please reach out to {contact} and add the following tags: {missing_list}.")
+        lines.extend(["", "   --- Existing tags (current key-value pairs) ---"])
+
+        tags = inst.get("tags") or {}
+        if tags:
+            for k, v in sorted(tags.items()):
+                lines.append(f"     {k}: {v}")
+        else:
+            lines.append("     (none)")
+
+        lines.append("")
+        lines.append("   --- Tags that need to be added ---")
+        for k in inst.get("missing_tags", []):
+            lines.append(f"     {k}: <add value per Cloud Tagging Policy>")
+        lines.append("")
+
+    lines.extend(
+        [
+            "",
+            "Required tags are defined in the Cloud Tagging Policy.",
+            "Add the missing tags in EC2 Console: Instances → select instance → Tags → Manage tags.",
+            "",
+            "This is an automated compliance notice.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def _publish_to_sns(
+    recipient_type: str,
+    recipient_email: str,
+    instance_id: str,
+    region: str,
+    stage: str,
     subject: str,
     body: str,
 ) -> bool:
-    """Send email via SES. Returns True on success, False on failure."""
-    if not SES_FROM_ADDRESS or not recipients:
-        logger.warning("SES send skipped: missing SES_FROM_ADDRESS or recipients")
-        return False
-    recipients = [r.strip() for r in recipients if r and r.strip()]
-    if not recipients:
+    """Publish notification to SNS topic. Returns True on success, False on failure."""
+    if not SNS_TOPIC_ARN:
+        logger.warning("SNS publish skipped: missing SNS_TOPIC_ARN")
         return False
     try:
-        ses = boto3.client("ses")
-        ses.send_email(
-            Source=SES_FROM_ADDRESS,
-            Destination={"ToAddresses": recipients},
-            Message={
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
-            },
+        sns = boto3.client("sns")
+        attrs = {
+            "recipient_type": {"DataType": "String", "StringValue": recipient_type},
+            "instance_id": {"DataType": "String", "StringValue": instance_id},
+            "region": {"DataType": "String", "StringValue": region},
+            "stage": {"DataType": "String", "StringValue": stage},
+        }
+        resp = sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=body,
+            MessageAttributes=attrs,
         )
-        logger.info("SES email sent to %s: %s", recipients, subject)
+        message_id = resp.get("MessageId")
+        logger.info("SNS published to %s (type=%s): %s (MessageId=%s)", recipient_email or recipient_type, recipient_type, subject, message_id)
         return True
     except ClientError as e:
-        logger.warning("SES send failed: %s", e)
+        logger.warning("SNS publish failed: %s", e)
         return False
 
 
@@ -337,64 +548,59 @@ def _tag_present(tags: dict, key: str) -> bool:
     return v is not None and str(v).strip() != ""
 
 
-def _resolve_recipient(inst: dict, tags: dict, region: str) -> tuple[str, str]:
+def _resolve_recipient(inst: dict, tags: dict, region: str) -> tuple[str, str, str | None]:
     """
-    1) OwnerEmail tag → email that person
+    1) OwnerEmail tag → notify TEAM_DL with contact_for_team = that email
     2) Else CloudTrail LookupEvents → classify creator:
-       - Human IAM user → if username looks like email, use it; else FINOPS_DL
-       - Human SSO (AWSReservedSSO_ role) → email user (sessionName)
-       - Terraform role / CI/CD role / any other assumed role (not SSO) → TEAM_DL
-       - AWSService (EC2 created by an AWS service) → TEAM_DL
-       - Unknown / no trail → FINOPS_DL (last resort)
-    Returns (email_address_or_identifier, reason_string).
+       - Human IAM user (username looks like email) → TEAM_DL, contact = email
+       - Human SSO (session looks like email) → TEAM_DL, contact = email
+       - Human/SSO with no email → FINOPS_DL, no contact
+       - Terraform / CI/CD / assumed role / AWS service → TEAM_DL, no contact
+       - Unknown / no trail → FINOPS_DL, no contact
+    Returns (recipient_email, reason_string, contact_for_team or None).
     """
-    # 1) OwnerEmail tag
+    # 1) OwnerEmail tag: send to TEAM_DL, include tag value as contact for "reach out to X"
     for key in ["OwnerEmail", "ownerEmail", "owner-email", "owner_email", "Owner", "NSAppOwner"]:
         val = tags.get(key)
         if val and _looks_like_email(val):
-            return val.strip(), f"OwnerEmail tag ({key})"
+            return TEAM_DL, f"OwnerEmail tag ({key})", val.strip()
 
     # 2) CloudTrail: who created the resource
     creator = _find_creator_via_cloudtrail(inst["InstanceId"], region)
     if not creator:
-        return FINOPS_DL, "Cloud/FinOps DL (no trail / unknown creator)"
+        return FINOPS_DL, "Cloud/FinOps DL (no trail / unknown creator)", None
 
     classification = _classify_creator(creator)
     if classification == "human":
         username = creator.get("userName") or creator.get("principalId") or "unknown"
         email = _user_to_email(username)
         if email:
-            return email, f"Human IAM user ({username})"
-        return FINOPS_DL, f"Human IAM user ({username}) — no email mapping, using FinOps DL"
+            return TEAM_DL, f"Human IAM user ({username})", email
+        return FINOPS_DL, f"Human IAM user ({username}) — no email mapping, using FinOps DL", None
 
-    # 🔹 NEW: direct SSO human routing
     if classification == "human_sso":
         email = creator.get("sessionName") or ""
         if _looks_like_email(email):
-            return email, f"Human SSO user ({email})"
-        # Fallback if session name is not an email for some reason
+            return TEAM_DL, f"Human SSO user ({email})", email
         role_name = creator.get("roleName") or "unknown"
-        return FINOPS_DL, f"SSO role ({role_name}) — session not an email, using FinOps DL"
+        return FINOPS_DL, f"SSO role ({role_name}) — session not an email, using FinOps DL", None
 
     if classification == "terraform":
         role_name = creator.get("roleName") or "unknown"
-        return TEAM_DL, f"Terraform role ({role_name}) → Team DL"
+        return TEAM_DL, f"Terraform role ({role_name}) → Team DL", None
 
     if classification == "cicd":
         role_name = creator.get("roleName") or "unknown"
-        return TEAM_DL, f"CI/CD role ({role_name}) → Team DL"
+        return TEAM_DL, f"CI/CD role ({role_name}) → Team DL", None
 
     if classification == "assumed_role":
-        # Assumed role but not SSO → Team DL
         role_name = creator.get("roleName") or "unknown"
-        return TEAM_DL, f"Assumed role ({role_name}) → Team DL"
+        return TEAM_DL, f"Assumed role ({role_name}) → Team DL", None
 
     if classification == "aws_service":
-        # EC2 created by an AWS service → Team DL
-        return TEAM_DL, "AWS service (creator) → Team DL"
+        return TEAM_DL, "AWS service (creator) → Team DL", None
 
-    # unknown / no trail → Cloud/FinOps DL (last resort)
-    return FINOPS_DL, f"Creator type {creator.get('type')} → Cloud/FinOps DL"
+    return FINOPS_DL, f"Creator type {creator.get('type')} → Cloud/FinOps DL", None
 
 
 def _classify_creator(creator: dict) -> str:
@@ -524,8 +730,10 @@ def _build_body(
         "day5": f"ESCALATION: EC2 instance {instance_id} in region {region} has been non-compliant for 5+ days. This case is escalated to FinOps/Team Lead.",
     }
     intro = intro_map.get(stage, intro_map["day0"])
+    name = _instance_name(tags)
     lines = [
         intro,
+        f"Instance name (Name tag): {name}" if name else "Instance name (Name tag): (not set)",
         "",
         "--- Existing tags (current key-value pairs) ---",
     ]
