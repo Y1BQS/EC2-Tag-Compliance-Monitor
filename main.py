@@ -226,6 +226,26 @@ def _instance_name(tags: dict) -> str | None:
 def lambda_handler(event, context):
     """Scan EC2 instances, resolve recipient, track state, then publish one SNS notification per recipient (Day 0/3/5 escalation)."""
     logger.info("Starting EC2 tag compliance scan; regions=%s", regions_to_scan())
+
+    # Determine the AWS account this Lambda is running in so notifications
+    # can include the owning account for each instance.
+    account_alias = None
+    try:
+        sts = boto3.client("sts")
+        account_id = sts.get_caller_identity().get("Account", "unknown")
+    except ClientError as e:
+        logger.warning("Failed to resolve AWS account ID: %s", e)
+        account_id = "unknown"
+
+    if account_id != "unknown":
+        try:
+            iam = boto3.client("iam")
+            aliases = iam.list_account_aliases().get("AccountAliases", [])
+            account_alias = aliases[0] if aliases else None
+        except ClientError as e:
+            logger.warning("Failed to resolve AWS account alias: %s", e)
+            account_alias = None
+
     total_scanned = total_noncompliant = total_notified = 0
     # recipient_email -> list of per-instance notification entries
     notifications_by_recipient: dict[str, list[dict]] = defaultdict(list)
@@ -353,7 +373,7 @@ def lambda_handler(event, context):
         # Determine recipient_type (already computed during aggregation, but recompute for consistency)
         recipient_type = _recipient_to_sns_type(recipient_email)
         subject = _build_batch_subject(recipient_email, recipient_type, instances, max_stage)
-        body = _build_batch_body(recipient_email, recipient_type, instances, max_stage)
+        body = _build_batch_body(recipient_email, recipient_type, instances, max_stage, account_id, account_alias)
 
         # Use the first instance for message attribute context
         first = instances[0]
@@ -439,6 +459,8 @@ def _build_batch_body(
     recipient_type: str,
     instances: list[dict],
     max_stage: str,
+    account_id: str | None = None,
+    account_alias: str | None = None,
 ) -> str:
     """Plain-text body for a batched notification per recipient."""
     stage_label = {
@@ -447,9 +469,30 @@ def _build_batch_body(
         "day5": "Escalation (Day 5+)",
     }.get(max_stage, "Initial notice")
 
+    if max_stage == "day0":
+        escalation_message = (
+            "If these tags are not added, a follow-up reminder will be sent on Day 3 "
+            "and this issue will be escalated to the Director/Manager on Day 5."
+        )
+    elif max_stage == "day3":
+        escalation_message = (
+            "If these tags are not added, this issue will be escalated to the Director/Manager "
+            "team on Day 5."
+        )
+    elif max_stage == "day5":
+        escalation_message = "This issue has been escalated to the Director/Manager."
+    else:
+        escalation_message = ""
+
     intro_lines = [
         f"This is a consolidated EC2 tag compliance notification ({stage_label}).",
         f"Recipient: {recipient_email} (type: {recipient_type})",
+        *( [escalation_message] if escalation_message else [] ),
+        *(
+            [f"AWS account: {account_alias} ({account_id})"]
+            if account_alias and account_id
+            else ([f"AWS account: {account_id}"] if account_id else [])
+        ),
         "",
         "The following EC2 instances are missing required tags and require your attention:",
         "",
@@ -543,8 +586,15 @@ def _publish_to_sns(
 
 
 def _tag_present(tags: dict, key: str) -> bool:
-    """True if key exists and value is non-empty."""
-    v = tags.get(key)
+    """True if required tag is effectively present and non-empty.
+
+    Special-case: treat either "app-name" or "application-name" as satisfying
+    the logical app-name requirement.
+    """
+    if key == "app-name":
+        v = tags.get("app-name") or tags.get("application-name")
+    else:
+        v = tags.get(key)
     return v is not None and str(v).strip() != ""
 
 
