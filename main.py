@@ -41,6 +41,7 @@ LOOKBACK_DAYS = int(os.environ.get("CLOUDTRAIL_LOOKBACK_DAYS", "30"))
 REGION_SCOPE = os.environ.get("REGION_SCOPE", "")
 STATE_TABLE = os.environ.get("STATE_TABLE", "")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+CW_METRIC_NAMESPACE = os.environ.get("CW_METRIC_NAMESPACE", "TagCompliance")
 
 
 def regions_to_scan():
@@ -396,6 +397,38 @@ def lambda_handler(event, context):
             )
 
     logger.info("Scan complete. scanned=%d noncompliant=%d notified=%d", total_scanned, total_noncompliant, total_notified)
+
+    # Publish simple run-level metrics to CloudWatch for dashboarding
+    try:
+        cloudwatch = boto3.client("cloudwatch")
+        now = datetime.now(timezone.utc)
+        metric_data = [
+            {
+                "MetricName": "Scanned",
+                "Timestamp": now,
+                "Value": float(total_scanned),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "NonCompliant",
+                "Timestamp": now,
+                "Value": float(total_noncompliant),
+                "Unit": "Count",
+            },
+            {
+                "MetricName": "Notified",
+                "Timestamp": now,
+                "Value": float(total_notified),
+                "Unit": "Count",
+            },
+        ]
+        cloudwatch.put_metric_data(
+            Namespace=CW_METRIC_NAMESPACE,
+            MetricData=metric_data,
+        )
+    except ClientError as e:
+        logger.warning("CloudWatch put_metric_data failed: %s", e)
+
     return {
         "scanned": total_scanned,
         "noncompliant": total_noncompliant,

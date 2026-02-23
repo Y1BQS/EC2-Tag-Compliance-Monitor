@@ -63,7 +63,7 @@ resource "aws_iam_role" "lambda" {
   })
 }
 
-# IAM policy: EC2, CloudTrail, DynamoDB, SNS
+# IAM policy: EC2, CloudTrail, DynamoDB, SNS, CloudWatch metrics
 resource "aws_iam_role_policy" "lambda" {
   name   = "${var.function_name}-policy"
   role   = aws_iam_role.lambda.id
@@ -96,6 +96,11 @@ resource "aws_iam_role_policy" "lambda" {
         Effect   = "Allow"
         Action   = ["sns:Publish"]
         Resource = [aws_sns_topic.compliance.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
       },
       {
         Effect   = "Allow"
