@@ -96,6 +96,73 @@ cat out.json
 | `user_map_table` | No | `""` | DynamoDB table for username → email |
 | `region_scope` | No | `""` | `all` for all regions |
 | `schedule_expression` | No | `rate(1 day)` | EventBridge schedule |
+| `analytics_bucket_name` | No | (generated) | S3 bucket for run metrics |
+| `run_metrics_prefix` | No | `runs/` | S3 prefix for run metrics |
+| `analytics_retention_days` | No | `90` | Delete analytics objects (runs/, missing-tags/) after N days; use `0` to disable |
+
+## Optional QuickSight dashboard setup (manual, S3 only)
+
+After Terraform is applied, the Lambda writes two S3 streams for QuickSight:
+
+- **Run metrics**: `s3://<analytics-bucket>/runs/YYYY/MM/DD/run-YYYYMMDD-HHMMSS.json` (one wide JSON object per run).
+- **Missing-tags summary**: `s3://<analytics-bucket>/missing-tags/YYYY/MM/DD/missing-tags-YYYYMMDD-HHMMSS.csv` (CSV with header: `run_timestamp`, `account_id`, `region_scope`, `total_scanned`, `total_noncompliant`, `total_notified`, `tag_name`, `instance_count`).
+
+### Prerequisites
+
+- Terraform applied (analytics S3 bucket exists).
+- Lambda has run at least once so `runs/` and (if any non-compliant instances) `missing-tags/` have data.
+
+### 1. IAM for QuickSight (S3)
+
+Attach a policy that allows read on both prefixes:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::<analytics-bucket>"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": [
+        "arn:aws:s3:::<analytics-bucket>/runs/*",
+        "arn:aws:s3:::<analytics-bucket>/missing-tags/*"
+      ]
+    }
+  ]
+}
+```
+
+Replace `<analytics-bucket>` with Terraform output `analytics_bucket_name`.
+
+### 2. Run metrics dataset and visuals
+
+The Lambda writes both:
+
+- **Historical per-run metrics** (JSON): `s3://<analytics-bucket>/runs/YYYY/MM/DD/run-YYYYMMDD-HHMMSS.json`
+- **Latest snapshot (overwritten each run, CSV)**: `s3://<analytics-bucket>/summary/summary.csv` (columns: `category`, `count`, with two rows: `Compliant` and `Non-Compliant`)
+
+1. **New dataset** → S3 → point at `runs/` (manifest or bucket/prefix), format **JSON**.
+2. Fields: `run_timestamp`, `account_id`, `region_scope`, `total_scanned`, `total_compliant`, `total_noncompliant`, `total_notified`.
+3. **Visuals**:
+   - For **history/trends**, build visuals from the `runs/` dataset.
+   - For a **current snapshot only**, create a second dataset pointing at `summary/` (format **CSV**, fields: `category`, `count`) and build your pie chart/KPIs from that dataset.
+
+### 3. Missing-tags dataset and bar chart
+
+The Lambda writes a single CSV under the `missing-tags/` prefix and overwrites it each run:
+
+- `s3://<analytics-bucket>/missing-tags/missing-tags.csv`
+
+1. **New dataset** → S3 → point at `missing-tags/` (files are `.csv`).
+2. Set file format to **CSV**. Fields: `category`, `count` (one row per tag; `category` = tag name, `count` = number of instances missing that tag).
+3. **Bar chart: instances missing per tag**
+   - X-axis: `category`
+   - Value: `count` (sum). You can filter or limit to focus on the most common missing tags.
 
 ## Project structure
 
@@ -103,7 +170,8 @@ cat out.json
 ├── main.py           # Lambda handler (scanner)
 ├── README.md
 └── terraform/
-    ├── main.tf
+    ├── main.tf       # Lambda, DynamoDB, SNS, EventBridge
+    ├── analytics.tf  # S3 analytics bucket for QuickSight (S3 data source)
     ├── variables.tf
     ├── outputs.tf
     └── README.md

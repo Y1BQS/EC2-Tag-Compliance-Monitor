@@ -22,3 +22,10 @@ output "sns_topic_arn" {
   description = "SNS topic ARN for compliance notifications"
   value       = aws_sns_topic.compliance.arn
 }
+
+# --- Analytics (S3 for QuickSight) ---
+
+output "analytics_bucket_name" {
+  description = "S3 bucket for run metrics (Lambda writes here; QuickSight S3 source reads)"
+  value       = aws_s3_bucket.analytics.id
+}

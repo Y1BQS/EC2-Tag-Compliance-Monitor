@@ -73,3 +73,23 @@ variable "schedule_expression" {
   type        = string
   default     = "cron(0 13 * * ? *)"
 }
+
+# --- Analytics (S3) for QuickSight ---
+
+variable "analytics_bucket_name" {
+  description = "S3 bucket name for tag compliance run metrics (analytics). If empty, a name is generated from function_name and account ID."
+  type        = string
+  default     = ""
+}
+
+variable "run_metrics_prefix" {
+  description = "S3 key prefix under analytics bucket for run metrics (e.g. runs/)"
+  type        = string
+  default     = "runs/"
+}
+
+variable "analytics_retention_days" {
+  description = "Number of days after which run metrics and missing-tags objects in the analytics bucket are deleted (0 = no lifecycle expiration)."
+  type        = number
+  default     = 90
+}

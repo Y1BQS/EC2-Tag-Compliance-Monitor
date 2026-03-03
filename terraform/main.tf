@@ -63,7 +63,7 @@ resource "aws_iam_role" "lambda" {
   })
 }
 
-# IAM policy: EC2, CloudTrail, DynamoDB, SNS, CloudWatch metrics
+# IAM policy: EC2, CloudTrail, DynamoDB, SNS, CloudWatch metrics, S3 run metrics
 resource "aws_iam_role_policy" "lambda" {
   name   = "${var.function_name}-policy"
   role   = aws_iam_role.lambda.id
@@ -88,7 +88,8 @@ resource "aws_iam_role_policy" "lambda" {
           "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
           "dynamodb:BatchGetItem",
-          "dynamodb:Query"
+          "dynamodb:Query",
+          "dynamodb:Scan"
         ]
         Resource = [aws_dynamodb_table.state.arn]
       },
@@ -111,6 +112,11 @@ resource "aws_iam_role_policy" "lambda" {
         Effect   = "Allow"
         Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
         Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = ["${aws_s3_bucket.analytics.arn}/*"]
       }
     ]
   })
@@ -162,6 +168,8 @@ resource "aws_lambda_function" "scanner" {
       EMAIL_DOMAIN            = var.email_domain
       USER_MAP_TABLE          = var.user_map_table
       REGION_SCOPE            = var.region_scope
+      RUN_METRICS_BUCKET      = aws_s3_bucket.analytics.id
+      RUN_METRICS_PREFIX      = var.run_metrics_prefix
     }
   }
 

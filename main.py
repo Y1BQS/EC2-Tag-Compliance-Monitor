@@ -8,12 +8,14 @@ that person. Sends notifications via SNS (no direct creator emails).
 Escalation: Day 0 → Team/FinOps DL; Day 3 → reminder; Day 5 → escalate to FinOps.
 State tracked in DynamoDB. Auto-close when tags fixed.
 """
+import csv
 import os
 import re
 import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 
 import boto3
 from botocore.exceptions import ClientError
@@ -42,6 +44,8 @@ REGION_SCOPE = os.environ.get("REGION_SCOPE", "")
 STATE_TABLE = os.environ.get("STATE_TABLE", "")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 CW_METRIC_NAMESPACE = os.environ.get("CW_METRIC_NAMESPACE", "TagCompliance")
+RUN_METRICS_BUCKET = os.environ.get("RUN_METRICS_BUCKET", "")
+RUN_METRICS_PREFIX = (os.environ.get("RUN_METRICS_PREFIX", "runs/")).rstrip("/") + "/"
 
 
 def regions_to_scan():
@@ -193,6 +197,84 @@ def _close_state_in_dynamodb(instance_id: str, region: str) -> None:
         logger.warning("DynamoDB close failed for %s in %s: %s", instance_id, region, e)
 
 
+def _parse_state_pk(pk: str) -> tuple[str, str] | None:
+    """Parse DynamoDB pk 'instance:{instance_id}:{region}' into (instance_id, region). Returns None if invalid."""
+    if not pk or not pk.startswith("instance:"):
+        return None
+    parts = pk.split(":", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        return None
+    return (parts[1], parts[2])
+
+
+def _close_orphaned_state_records() -> None:
+    """Close DynamoDB state for any recorded instance that no longer exists (or is terminated) in EC2."""
+    if not STATE_TABLE:
+        return
+    try:
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(STATE_TABLE)
+        items = []
+        scan_kwargs = {
+            "FilterExpression": "sk = :sk AND #st <> :closed",
+            "ExpressionAttributeNames": {"#st": "stage"},
+            "ExpressionAttributeValues": {":sk": "state", ":closed": "closed"},
+        }
+        while True:
+            response = table.scan(**scan_kwargs)
+            items.extend(response.get("Items", []))
+            if "LastEvaluatedKey" not in response:
+                break
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+        for item in items:
+            pk = item.get("pk")
+            parsed = _parse_state_pk(pk)
+            if not parsed:
+                continue
+            instance_id, region = parsed
+            try:
+                ec2 = boto3.client("ec2", region_name=region)
+                resp = ec2.describe_instances(InstanceIds=[instance_id])
+                reservations = resp.get("Reservations", [])
+                instances = []
+                for res in reservations:
+                    instances.extend(res.get("Instances", []))
+                if not instances:
+                    _close_state_in_dynamodb(instance_id, region)
+                    logger.info(
+                        "Closed state for non-existent instance %s in %s",
+                        instance_id,
+                        region,
+                    )
+                else:
+                    state_name = (instances[0].get("State") or {}).get("Name")
+                    if state_name in ("terminated", "shutting-down"):
+                        _close_state_in_dynamodb(instance_id, region)
+                        logger.info(
+                            "Closed state for terminated instance %s in %s (orphan cleanup)",
+                            instance_id,
+                            region,
+                        )
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "InvalidInstanceID.NotFound":
+                    _close_state_in_dynamodb(instance_id, region)
+                    logger.info(
+                        "Closed state for non-existent instance %s in %s",
+                        instance_id,
+                        region,
+                    )
+                else:
+                    logger.warning(
+                        "Could not check instance %s in %s: %s",
+                        instance_id,
+                        region,
+                        e,
+                    )
+    except ClientError as e:
+        logger.warning("DynamoDB scan failed for orphan cleanup: %s", e)
+
+
 def _days_since(first_detected_at: str) -> int:
     """Compute whole days since firstDetectedAt (ISO string)."""
     try:
@@ -247,9 +329,14 @@ def lambda_handler(event, context):
             logger.warning("Failed to resolve AWS account alias: %s", e)
             account_alias = None
 
+    # Close state for instances that no longer exist (or are terminated) so we don't keep orphan rows
+    _close_orphaned_state_records()
+
     total_scanned = total_noncompliant = total_notified = 0
     # recipient_email -> list of per-instance notification entries
     notifications_by_recipient: dict[str, list[dict]] = defaultdict(list)
+    # tag_key -> count of non-compliant instances missing that tag (for S3 missing-tags summary)
+    missing_tag_counts: dict[str, int] = defaultdict(int)
 
     for region in regions_to_scan():
         ec2 = boto3.client("ec2", region_name=region)
@@ -258,11 +345,20 @@ def lambda_handler(event, context):
             for reservation in page.get("Reservations", []):
                 for inst in reservation.get("Instances", []):
                     state_name = inst.get("State", {}).get("Name")
+                    instance_id = inst["InstanceId"]
                     if state_name in ("terminated", "shutting-down"):
+                        # Close DynamoDB state for terminated instances so we don't keep orphan rows
+                        state = _get_state_from_dynamodb(instance_id, region)
+                        if state and state.get("stage") != "closed":
+                            _close_state_in_dynamodb(instance_id, region)
+                            logger.info(
+                                "Closed state for terminated instance %s in %s",
+                                instance_id,
+                                region,
+                            )
                         continue
 
                     total_scanned += 1
-                    instance_id = inst["InstanceId"]
                     tags = (
                         {t["Key"]: t.get("Value", "") for t in inst.get("Tags", [])}
                         if inst.get("Tags")
@@ -300,6 +396,9 @@ def lambda_handler(event, context):
                             ",".join(missing),
                         )
                         total_noncompliant += 1
+                        for tag_key in missing:
+                            missing_tag_counts[tag_key] += 1
+
                         recipient, reason, contact_for_team = _resolve_recipient(inst, tags, region)
                         state = _get_state_from_dynamodb(instance_id, region)
 
@@ -428,6 +527,86 @@ def lambda_handler(event, context):
         )
     except ClientError as e:
         logger.warning("CloudWatch put_metric_data failed: %s", e)
+
+    # Write run metrics to S3 for QuickSight (partitioned by year/month/day), one JSON object per run
+    if RUN_METRICS_BUCKET:
+        try:
+            now = datetime.now(timezone.utc)
+            # Wide format: one row with separate columns per metric
+            wide_row = {
+                "run_timestamp": now.isoformat(),
+                "account_id": account_id,
+                "region_scope": REGION_SCOPE or os.environ.get("AWS_REGION", "us-east-1"),
+                "total_scanned": int(total_scanned),
+                "total_compliant": int(total_scanned) - int(total_noncompliant),
+                "total_noncompliant": int(total_noncompliant),
+                "total_notified": int(total_notified),
+            }
+            payload = json.dumps(wide_row)
+            s3 = boto3.client("s3")
+
+            # 1) Historical per-run record under runs/YYYY/MM/DD/
+            run_key = (
+                f"{RUN_METRICS_PREFIX}{now.year:04d}/{now.month:02d}/{now.day:02d}/"
+                f"run-{now.strftime('%Y%m%d-%H%M%S')}.json"
+            )
+            s3.put_object(
+                Bucket=RUN_METRICS_BUCKET,
+                Key=run_key,
+                Body=payload,
+                ContentType="application/json",
+                ServerSideEncryption="AES256",
+            )
+            logger.info("Run metrics written to s3://%s/%s", RUN_METRICS_BUCKET, run_key)
+
+            # 2) Latest snapshot overwritten each run under summary/summary.csv (CSV with category/count)
+            summary_key = "summary/summary.csv"
+            summary_rows = [
+                {"category": "Compliant", "count": int(total_scanned) - int(total_noncompliant)},
+                {"category": "Non-Compliant", "count": int(total_noncompliant)},
+            ]
+            summary_buf = StringIO()
+            summary_writer = csv.DictWriter(summary_buf, fieldnames=["category", "count"])
+            summary_writer.writeheader()
+            summary_writer.writerows(summary_rows)
+            summary_body = summary_buf.getvalue()
+            s3.put_object(
+                Bucket=RUN_METRICS_BUCKET,
+                Key=summary_key,
+                Body=summary_body,
+                ContentType="text/csv",
+                ServerSideEncryption="AES256",
+            )
+            logger.info("Run metrics summary written to s3://%s/%s", RUN_METRICS_BUCKET, summary_key)
+        except ClientError as e:
+            logger.warning("S3 run metrics write failed: %s", e)
+
+    # Write pre-aggregated missing-tags summary to S3 as CSV (overwritten each run, one row per tag)
+    if RUN_METRICS_BUCKET and missing_tag_counts:
+        try:
+            key = "missing-tags/missing-tags.csv"
+            fieldnames = ["category", "count"]
+            rows = [
+                {"category": tag_key, "count": count}
+                for tag_key, count in sorted(missing_tag_counts.items())
+            ]
+            buf = StringIO()
+            writer = csv.DictWriter(buf, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            body = buf.getvalue()
+
+            s3 = boto3.client("s3")
+            s3.put_object(
+                Bucket=RUN_METRICS_BUCKET,
+                Key=key,
+                Body=body,
+                ContentType="text/csv",
+                ServerSideEncryption="AES256",
+            )
+            logger.info("Missing-tags summary written to s3://%s/%s", RUN_METRICS_BUCKET, key)
+        except ClientError as e:
+            logger.warning("S3 missing-tags summary write failed: %s", e)
 
     return {
         "scanned": total_scanned,
@@ -576,7 +755,7 @@ def _build_batch_body(
             "Required tags are defined in the Cloud Tagging Policy.",
             "Add the missing tags in EC2 Console: Instances → select instance → Tags → Manage tags.",
             "",
-            "This is an automated compliance notice.",
+            "If there are any further questions or help needed, please reach out to FinOps Engineer at Mohit.Malik@nscorp.com",
         ]
     )
 
@@ -797,46 +976,4 @@ def _looks_like_email(s: str) -> bool:
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(s).strip()))
 
 
-def _build_body(
-    instance_id: str,
-    region: str,
-    tags: dict,
-    missing: list,
-    recipient: str,
-    reason: str,
-    stage: str = "day0",
-) -> str:
-    """Plain-text email body. stage: day0 | day3 | day5 for escalation context."""
-    intro_map = {
-        "day0": f"EC2 instance {instance_id} in region {region} is missing required tags. This is your initial notification.",
-        "day3": f"REMINDER: EC2 instance {instance_id} in region {region} is still missing required tags (3+ days since first detection).",
-        "day5": f"ESCALATION: EC2 instance {instance_id} in region {region} has been non-compliant for 5+ days. This case is escalated to FinOps/Team Lead.",
-    }
-    intro = intro_map.get(stage, intro_map["day0"])
-    name = _instance_name(tags)
-    lines = [
-        intro,
-        f"Instance name (Name tag): {name}" if name else "Instance name (Name tag): (not set)",
-        "",
-        "--- Existing tags (current key-value pairs) ---",
-    ]
-    if tags:
-        for k, v in sorted(tags.items()):
-            lines.append(f"  {k}: {v}")
-    else:
-        lines.append("  (none)")
-    lines.extend(["", "--- Tags that need to be added ---"])
-    for k in missing:
-        lines.append(f"  {k}: <add value per Cloud Tagging Policy>")
-    lines.extend(
-        [
-            "",
-            f"Notification sent to: {recipient} ({reason})",
-            "",
-            "Required tags are defined in the Cloud Tagging Policy.",
-            "Add the missing tags in EC2 Console: Instances → select instance → Tags → Manage tags.",
-            "",
-            "This is an automated compliance notice.",
-        ]
-    )
-    return "\n".join(lines)
+

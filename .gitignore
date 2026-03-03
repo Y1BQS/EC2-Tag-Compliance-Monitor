@@ -23,3 +23,5 @@ terraform/*.tfstate.*
 terraform/.terraform.lock.hcl
 terraform/lambda.zip
 terraform.tfstate
+
+manifest1.json
