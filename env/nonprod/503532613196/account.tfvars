@@ -6,7 +6,7 @@ aws_account_id  = "503532613196"
 aws_region      = "us-east-1"
 
 # IAM role that GitHub Actions will assume via OIDC for this account
-assume_role_arn = "arn:aws:iam::347116755583:role/github-terraform-aws"
+assume_role_arn = "arn:aws:iam::503532613196:role/github-terraform-aws"
 
 # Remote Terraform state bucket for this account/environment
 tf_state_bucket = "ns-terraform-state-503532613196"

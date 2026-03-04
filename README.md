@@ -154,6 +154,60 @@ There are two workflows under `.github/workflows/`:
 4. Run the workflow and review the Terraform plan.
 5. Re-run the workflow with `action` = `apply` to deploy.
 
+### 5. How to add another AWS account
+
+To target an additional AWS account from the workflow:
+
+1. **Choose environment and account ID**
+   - Decide whether this account is `dev` or `prod` (must match the `environment` input you will use in the workflow).
+   - Note the 12-digit AWS account ID (for example `503532613196`).
+   - Create a folder: `env/<environment>/<account-id>/` (for example `env/dev/503532613196/`).
+
+2. **Create `account.tfvars` for that account**
+   - In the new folder, create `account.tfvars`:
+
+   ```hcl
+   aws_account_id  = "503532613196"
+   aws_region      = "us-east-1"
+
+   # IAM role in that account that GitHub will assume via OIDC
+   assume_role_arn = "arn:aws:iam::503532613196:role/github-terraform-aws"
+
+   # S3 bucket that will hold Terraform state for this stack
+   tf_state_bucket = "ns-terraform-state-503532613196-us-east-1"
+   tf_state_region = "us-east-1"
+
+   # Required emails for this Terraform stack
+   fallback_finops_dl = "finops@yourcompany.com"
+   terraform_team_dl  = "cloud-team@yourcompany.com"
+
+   tags = {
+     app-name    = "tag-compliance-scanner"
+     environment = "dev" # or "prod" if under env/prod
+     ManagedBy   = "terraform"
+   }
+   ```
+
+   - You may override any optional variables from `terraform/variables.tf` (for example `platform_app_dl`, `region_scope`, or `analytics_retention_days`) in this same file if needed.
+
+3. **Prepare the AWS account**
+   - In the target AWS account:
+     - Create or reuse the IAM role referenced in `assume_role_arn` and configure GitHub OIDC trust.
+     - Attach a policy that allows that role to manage the resources defined in `terraform/` (Lambda, DynamoDB, SNS, EventBridge, and the analytics S3 bucket).
+     - Create the S3 bucket named in `tf_state_bucket` in `tf_state_region` and allow the role to read/write state objects.
+
+4. **Use the new account in the workflow**
+   - Commit and push the new `env/<environment>/<account-id>/account.tfvars`.
+   - In GitHub, go to **Actions** → **Terraform Tag Compliance Scanner**.
+   - Click **Run workflow** and select:
+     - `action`: `plan`, `apply`, or `destroy`
+     - `environment`: `dev` or `prod` (matching the folder you used)
+     - `account`: the 12-digit account ID you just added
+   - The workflow will automatically:
+     - Validate that `env/<environment>/<account>/account.tfvars` exists.
+     - Parse `assume_role_arn`, `aws_region`, `tf_state_bucket`, and `tf_state_region` from that file.
+     - Assume the IAM role and run Terraform against that AWS account.
+
 
 ## Test
 
