@@ -14,7 +14,7 @@ on:
         options:
           - all
           - prod
-          - dev
+          - nonprod
 
 jobs:
   list-configs:

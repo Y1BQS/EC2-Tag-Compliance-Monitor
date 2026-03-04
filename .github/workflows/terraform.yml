@@ -22,7 +22,7 @@ on:
         required: true
         type: choice
         options:
-          - dev
+          - nonprod
           - prod
 
       account:
@@ -63,7 +63,7 @@ jobs:
           if [ ! -f "$TFVARS_PATH" ]; then
             echo "::error::Account configuration not found: $TFVARS_PATH"
             echo "Available configurations:"
-            find env -name "account.tfvars" -type f 2>/dev/null || echo "No account.tfvars found"
+            find env -name "account.tfvars" -type f 2>/nonprod/null || echo "No account.tfvars found"
             exit 1
           fi
 
