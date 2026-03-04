@@ -154,14 +154,6 @@ jobs:
             -no-color
         continue-on-error: ${{ inputs.action == 'plan' }}
 
-      - name: Terraform Plan (print to summary)
-        if: inputs.action == 'plan'
-        working-directory: terraform
-        run: |
-          terraform plan \
-            -var-file="../env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars" \
-            -no-color | tee plan.out
-
       - name: Terraform Apply
         if: inputs.action == 'apply'
         working-directory: terraform
