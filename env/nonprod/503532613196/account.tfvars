@@ -9,7 +9,7 @@ aws_region      = "us-east-1"
 assume_role_arn = "arn:aws:iam::503532613196:role/github-terraform-aws"
 
 # Remote Terraform state bucket for this account/environment
-tf_state_bucket = "ns-terraform-state-503532613196"
+tf_state_bucket = "ns-terraform-state-503532613196-us-east-1"
 tf_state_region = "us-east-1"
 
 # Required variables for this Terraform stack
