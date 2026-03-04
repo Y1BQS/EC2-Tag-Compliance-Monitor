@@ -84,11 +84,6 @@ For each environment/account, create an `account.tfvars` file:
 env/<environment>/<account>/account.tfvars
 ```
 
-This repo already includes examples for:
-
-- `env/dev/347116755583/account.tfvars`
-- `env/prod/173534767488/account.tfvars`
-
 Each file should define at least:
 
 ```hcl
