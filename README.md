@@ -32,7 +32,7 @@ Config-free AWS tag compliance scanner with escalation. Scans EC2 instances for 
 
 Recipient is chosen per instance: OwnerEmail tag or CloudTrail creator (Human, SSO, Terraform, CI/CD) → Team DL or FinOps DL. Creator identity is included in the email body so the team can contact that person; no direct emails to creators.
 
-## Deploy with Terraform
+## Deploy with Terraform (locally)
 
 ### 1. Configure variables
 
@@ -61,7 +61,7 @@ terraform plan
 terraform apply
 ```
 
-### 3. Deploy to another AWS account
+### 3. Deploy to another AWS account (locally)
 
 Use an AWS profile or assume role:
 
@@ -71,6 +71,89 @@ AWS_PROFILE=other-account terraform apply -var-file=terraform.tfvars
 ```
 
 Ensure CloudTrail is set up in each target account. SNS subscriptions (FinOps DL, Team DL) must be confirmed via the emails AWS sends.
+
+## Deploy with Terraform via GitHub Actions
+
+This repository includes GitHub Actions workflows that let any team member deploy the Tag Compliance Scanner to any configured AWS account using the same pattern as the example Terraform repo.
+
+### 1. Configure per-account settings
+
+For each environment/account, create an `account.tfvars` file:
+
+```text
+env/<environment>/<account>/account.tfvars
+```
+
+This repo already includes examples for:
+
+- `env/dev/347116755583/account.tfvars`
+- `env/prod/173534767488/account.tfvars`
+
+Each file should define at least:
+
+```hcl
+aws_account_id  = "<12-digit-account-id>"
+aws_region      = "us-east-1"
+assume_role_arn = "arn:aws:iam::<account-id>:role/github-terraform-aws"
+
+tf_state_bucket = "<s3-bucket-for-terraform-state>"
+tf_state_region = "us-east-1"
+
+fallback_finops_dl = "finops@yourcompany.com"
+terraform_team_dl  = "cloud-team@yourcompany.com"
+```
+
+You can also override any Terraform variables defined in `terraform/variables.tf` (for example `platform_app_dl`, `region_scope`, or `analytics_retention_days`) by adding them to the same `account.tfvars` file.
+
+### 2. AWS IAM and OIDC requirements
+
+For each AWS account you want to target:
+
+- Configure a GitHub OIDC trust relationship and create an IAM role such as `github-terraform-aws`.
+- Grant that role permissions to manage the resources defined in `terraform/` (Lambda, DynamoDB, SNS, EventBridge, and the analytics S3 bucket).
+- Use the ARN of that role as `assume_role_arn` in the corresponding `account.tfvars`.
+
+The Terraform state for each environment/account is stored in the S3 bucket specified by `tf_state_bucket`, under a key:
+
+```text
+tag-compliance/<environment>/<account>/terraform.tfstate
+```
+
+Make sure the state bucket exists and is accessible by the IAM role.
+
+### 3. Workflows
+
+There are two workflows under `.github/workflows/`:
+
+- `List Tag Compliance Configurations` (`list-configs.yml`):
+  - Trigger: `workflow_dispatch`.
+  - Input: `environment` (`all`, `dev`, or `prod`).
+  - Output: a table in the job summary listing `env/<environment>/<account>/account.tfvars` files.
+
+- `Terraform Tag Compliance Scanner` (`terraform.yml`):
+  - Trigger: `workflow_dispatch`.
+  - Inputs:
+    - `action`: `plan`, `apply`, or `destroy`
+    - `environment`: `dev` or `prod`
+    - `account`: 12-digit AWS account ID
+  - Behavior:
+    - Validates that `env/<environment>/<account>/account.tfvars` exists.
+    - Parses `assume_role_arn`, `aws_region`, `tf_state_bucket`, and `tf_state_region`.
+    - Assumes the IAM role via GitHub OIDC.
+    - Runs `terraform init`, `terraform validate`, and `terraform plan`/`apply`/`destroy` in the `terraform/` directory using the selected `account.tfvars`.
+    - Writes a summary (inputs, state bucket, result) to the GitHub Actions job summary.
+
+### 4. Example GitHub deployment flow
+
+1. Ensure `env/dev/<account>/account.tfvars` is configured and the IAM role/state bucket exist.
+2. In GitHub, go to **Actions** → **Terraform Tag Compliance Scanner**.
+3. Choose:
+   - `action` = `plan`
+   - `environment` = `dev`
+   - `account` = `<12-digit-account-id>`
+4. Run the workflow and review the Terraform plan.
+5. Re-run the workflow with `action` = `apply` to deploy.
+
 
 ## Test
 

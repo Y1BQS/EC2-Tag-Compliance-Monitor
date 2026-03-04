@@ -1,0 +1,60 @@
+################################################################################
+# List Available Tag Compliance Account Configurations
+################################################################################
+
+name: List Tag Compliance Configurations
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to list'
+        required: true
+        type: choice
+        options:
+          - all
+          - prod
+          - dev
+
+jobs:
+  list-configs:
+    name: List Configurations
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: List account configurations
+        run: |
+          echo "## Available Tag Compliance Configurations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.environment }}" = "all" ]; then
+            SEARCH_PATH="env"
+          else
+            SEARCH_PATH="env/${{ inputs.environment }}"
+          fi
+
+          if [ ! -d "$SEARCH_PATH" ]; then
+            echo "No configurations found in $SEARCH_PATH" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          echo "| Environment | Account | Config File |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|---------|-------------|" >> $GITHUB_STEP_SUMMARY
+
+          find "$SEARCH_PATH" -name "account.tfvars" -type f | sort | while read -r file; do
+            rel_path="${file#env/}"
+            env_name=$(echo "$rel_path" | cut -d'/' -f1)
+            account=$(echo "$rel_path" | cut -d'/' -f2)
+
+            echo "| $env_name | $account | $file |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Quick Reference" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To deploy the Tag Compliance Scanner, use the **Terraform Tag Compliance Scanner** workflow with:" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: \`<environment>\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Account: \`<account>\`" >> $GITHUB_STEP_SUMMARY
+

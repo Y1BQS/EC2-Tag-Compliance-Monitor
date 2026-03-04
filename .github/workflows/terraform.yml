@@ -1,0 +1,199 @@
+################################################################################
+# Terraform Tag Compliance Scanner Workflow
+# Deploy the Lambda/DynamoDB/EventBridge stack per environment/account
+################################################################################
+
+name: Terraform Tag Compliance Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+      account:
+        description: 'AWS Account Number (12 digits)'
+        required: true
+        type: string
+
+env:
+  TF_VERSION: "1.10.0"
+
+jobs:
+  validate-inputs:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      config_exists: ${{ steps.check.outputs.exists }}
+      aws_role_arn: ${{ steps.parse.outputs.aws_role_arn }}
+      aws_region: ${{ steps.parse.outputs.aws_region }}
+      tf_state_bucket: ${{ steps.parse.outputs.tf_state_bucket }}
+      tf_state_region: ${{ steps.parse.outputs.tf_state_region }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate account number format
+        run: |
+          if [[ ! "${{ inputs.account }}" =~ ^[0-9]{12}$ ]]; then
+            echo "::error::Account number must be exactly 12 digits"
+            exit 1
+          fi
+
+      - name: Check account configuration exists
+        id: check
+        run: |
+          TFVARS_PATH="env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars"
+
+          if [ ! -f "$TFVARS_PATH" ]; then
+            echo "::error::Account configuration not found: $TFVARS_PATH"
+            echo "Available configurations:"
+            find env -name "account.tfvars" -type f 2>/dev/null || echo "No account.tfvars found"
+            exit 1
+          fi
+
+          echo "exists=true" >> $GITHUB_OUTPUT
+          echo "Configuration validated:"
+          echo "  Account config: $TFVARS_PATH"
+
+      - name: Parse account configuration
+        id: parse
+        run: |
+          TFVARS_PATH="env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars"
+
+          get_tfvar() {
+            grep "^$1" "$TFVARS_PATH" | sed 's/.*=\s*"\?\([^"]*\)"\?.*/\1/' | tr -d ' '
+          }
+
+          AWS_ROLE_ARN=$(get_tfvar "assume_role_arn")
+          AWS_REGION=$(get_tfvar "aws_region")
+          TF_STATE_BUCKET=$(get_tfvar "tf_state_bucket")
+          TF_STATE_REGION=$(get_tfvar "tf_state_region")
+
+          if [ -z "$AWS_ROLE_ARN" ]; then
+            echo "::error::Missing assume_role_arn in account.tfvars"
+            exit 1
+          fi
+          if [ -z "$TF_STATE_BUCKET" ]; then
+            echo "::error::Missing tf_state_bucket in account.tfvars"
+            exit 1
+          fi
+
+          echo "aws_role_arn=$AWS_ROLE_ARN" >> $GITHUB_OUTPUT
+          echo "aws_region=${AWS_REGION:-us-east-1}" >> $GITHUB_OUTPUT
+          echo "tf_state_bucket=$TF_STATE_BUCKET" >> $GITHUB_OUTPUT
+          echo "tf_state_region=${TF_STATE_REGION:-us-east-1}" >> $GITHUB_OUTPUT
+
+  terraform:
+    name: Terraform ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    if: needs.validate-inputs.outputs.config_exists == 'true'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment: ${{ inputs.environment }}
+
+    concurrency:
+      group: terraform-tag-compliance-${{ inputs.environment }}-${{ inputs.account }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.validate-inputs.outputs.aws_role_arn }}
+          aws-region: ${{ needs.validate-inputs.outputs.aws_region }}
+
+      - name: Terraform Init
+        id: init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ needs.validate-inputs.outputs.tf_state_bucket }}" \
+            -backend-config="region=${{ needs.validate-inputs.outputs.tf_state_region }}" \
+            -backend-config="key=tag-compliance/${{ inputs.environment }}/${{ inputs.account }}/terraform.tfstate" \
+            -backend-config="use_lockfile=true" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var-file="../env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars" \
+            -no-color
+        continue-on-error: ${{ inputs.action == 'plan' }}
+
+      - name: Terraform Plan Output
+        if: inputs.action == 'plan'
+        working-directory: terraform
+        run: terraform show -no-color tfplan || true
+
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var-file="../env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars" \
+            -out=tfplan \
+            -no-color
+          terraform apply \
+            -auto-approve \
+            tfplan
+
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform
+        run: |
+          terraform destroy \
+            -var-file="../env/${{ inputs.environment }}/${{ inputs.account }}/account.tfvars" \
+            -auto-approve
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, terraform]
+    if: always()
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "## Terraform Tag Compliance Scanner" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | ${{ inputs.action }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Account | ${{ inputs.account }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| State Bucket | ${{ needs.validate-inputs.outputs.tf_state_bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ needs.terraform.result }} |" >> $GITHUB_STEP_SUMMARY
+
